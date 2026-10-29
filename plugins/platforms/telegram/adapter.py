@@ -28,6 +28,64 @@ from gateway.platforms._shared import (
 )
 
 
+# Container-update plan buttons (``cu:<plan_id>``), local patch (voyager).  The plan
+# itself is written by the nightly container-updates check; this side only
+# validates the id, asks that script whether the plan is still tappable, and
+# launches its worker.
+CONTAINER_UPDATE_SCRIPT = "/home/archon/.hermes/scripts/container-updates-check.py"
+_CONTAINER_UPDATE_PLAN_ID_RE = re.compile(r"^\d{8}-\d{6}$")
+
+
+def _container_update_plan_verdict(plan_id: str) -> dict:
+    """Ask the check script whether this plan should run. Blocking; call in a thread.
+
+    The verdict comes from the script rather than being recomputed here on
+    purpose: a second copy of "is this plan still valid" living in the adapter is
+    how a Started toast ends up on a run that then refuses itself.
+    """
+    import subprocess as _subprocess
+
+    try:
+        proc = _subprocess.run(
+            [sys.executable, CONTAINER_UPDATE_SCRIPT, "--check-plan", plan_id],
+            capture_output=True, text=True, timeout=20,
+        )
+        if proc.returncode != 0:
+            return {"ok": False, "reason": "Update plan could not be read."}
+        return json.loads((proc.stdout or "").strip().splitlines()[-1])
+    except Exception as exc:
+        logger.warning("[Telegram] container-update plan check failed: %s", exc)
+        return {"ok": False, "reason": "Update plan could not be read."}
+
+
+def _launch_container_update_worker(plan_id: str) -> bool:
+    """Spawn the detached worker. Blocking; call in a thread.
+
+    start_new_session detaches it from the gateway: a gateway restart mid-sweep
+    must not kill a run that is halfway through recreating containers, and the
+    worker resumes from its own plan file if it is killed anyway.
+    """
+    import subprocess as _subprocess
+
+    try:
+        with open(os.devnull, "wb") as devnull:
+            _subprocess.Popen(
+                [sys.executable, CONTAINER_UPDATE_SCRIPT, "--apply-plan", plan_id],
+                stdin=_subprocess.DEVNULL, stdout=devnull, stderr=devnull,
+                start_new_session=True,
+            )
+        return True
+    except Exception as exc:
+        logger.error("[Telegram] container-update worker launch failed: %s", exc)
+        return False
+
+
+def _clarify_button_label(choice: object, idx: int) -> str:
+    """Caption for clarify choice ``idx``: its own text, cut to 30 chars (local patch, voyager)."""
+    label = str(choice).strip() or str(idx + 1)
+    return label if len(label) <= 30 else label[:29].rstrip() + "\u2026"
+
+
 def _redact_telegram_error_text(error: object) -> str:
     """Redact secrets from Telegram transport errors before logging or returning them."""
     text = "" if error is None else str(error)
@@ -4291,10 +4349,13 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             text = f"❓ {_html.escape(question)}"
             keyboard = None
             if choices:
-                # Full option text in the body (mobile truncates button labels); buttons keep numeric labels.
+                # Full option text in the body (mobile truncates button labels).
                 text += "\n\n" + "\n".join(f"{i + 1}. {_html.escape(str(c))}" for i, c in enumerate(choices))
                 # Telegram caps callback_data at 64 bytes; keep "cl:<id>:<idx>" short.
-                rows = [[InlineKeyboardButton(str(idx + 1), callback_data=f"cl:{clarify_id}:{idx}")] for idx in range(len(choices))]
+                # Local patch (voyager): buttons show the option text cut to ~30 chars instead of bare
+                # numbers. Code-point slicing can split a ZWJ/flag emoji cluster; fine for short labels.
+                rows = [[InlineKeyboardButton(_clarify_button_label(c, idx), callback_data=f"cl:{clarify_id}:{idx}")]
+                        for idx, c in enumerate(choices)]
                 rows.append([InlineKeyboardButton(t("platform.telegram.prompt.other"), callback_data=f"cl:{clarify_id}:other")])
                 keyboard = InlineKeyboardMarkup(rows)
             return text, keyboard, lambda msg: self._clarify_state.__setitem__(clarify_id, session_key)
@@ -4728,10 +4789,46 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         for prefix, handler in (
             ("gt:", self._handle_gmail_triage_callback), ("ea:", self._handle_exec_approval_callback),
             ("sc:", self._handle_slash_confirm_callback), ("cl:", self._handle_clarify_callback),
-            ("update_prompt:", self._handle_update_prompt_callback)):
+            ("update_prompt:", self._handle_update_prompt_callback),
+            ("cu:", self._handle_container_update_callback)):  # local patch (voyager)
             if data.startswith(prefix):
                 await handler(query, data, cb)
                 return
+
+    async def _handle_container_update_callback(self, query, data: str, cb: dict[str, Any]) -> None:
+        """``cu:<plan_id>`` — launch the frozen container-update plan (local patch, voyager).
+
+        Deliberately NOT a chat-replay button: "update all" once meant a model
+        re-derived the pending list at tap time and drove Docker by hand, which was
+        non-deterministic and died on the turn limit mid-sweep.  The payload names a
+        plan the nightly report already froze; the gateway only launches the
+        deterministic worker for it.  The payload is client-supplied, so the id is
+        shape-checked and never interpolated into a shell.
+        """
+        plan_id = data[3:].strip()
+        if not _CONTAINER_UPDATE_PLAN_ID_RE.match(plan_id):
+            await query.answer()
+            return
+        if not await self._callback_authorized(query, cb, "\u26d4 You are not authorized to use this button."):
+            return
+        query_message = getattr(query, "message", None)
+        verdict = await asyncio.to_thread(_container_update_plan_verdict, plan_id)
+        if not verdict.get("ok"):
+            with contextlib.suppress(Exception):
+                await query_message.edit_reply_markup(reply_markup=None)
+            await query.answer(text=verdict.get("reason") or "Not available.", show_alert=True)
+            return
+        try:
+            await query_message.edit_reply_markup(reply_markup=None)
+        except Exception as exc:
+            logger.debug("[Telegram] container-update keyboard strip failed: %s", exc)
+        if not await asyncio.to_thread(_launch_container_update_worker, plan_id):
+            await query.answer(text="Could not start the update worker.", show_alert=True)
+            return
+        pending = verdict.get("pending") or 0
+        await query.answer(text=f"Applying {pending} update{'s' if pending != 1 else ''}\u2026")
+        logger.info("[Telegram] Container-update plan launched (user=%s, plan=%s, pending=%s)",
+                    cb.get("user_name") or getattr(query.from_user, "id", ""), plan_id, pending)
 
     async def _claim_callback_state(self, query, cb: dict[str, Any], state: dict, key, denial: str, resolved: str, *, pop: bool = True):
         """Auth-gate a button tap, then claim its pending entry; None (after answering) when refused or expired."""
