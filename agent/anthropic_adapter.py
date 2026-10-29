@@ -462,7 +462,7 @@ def _is_oauth_token(key: str) -> bool:
     if not key:
         return False
     # Regular Anthropic Console API keys — x-api-key auth, never OAuth
-    if key.startswith("sk-ant-api"):
+    if key.startswith(("sk-ant-api", "sk-ant-usr")):
         return False
     # Anthropic-issued tokens (setup-tokens sk-ant-oat-*, managed keys)
     if key.startswith("sk-ant-"):

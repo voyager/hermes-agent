@@ -26,6 +26,84 @@ logger = logging.getLogger(__name__)
 from agent.deadline import run_bounded_async
 
 
+# Quick-reply buttons (``qr:<text>``): a bot-sent message may carry a button
+# whose tap is treated exactly as if the user had typed the payload.  There is
+# no stored state — the text rides in ``callback_data`` (Telegram caps it at 64
+# bytes), single use comes from stripping the keyboard, and expiry is derived
+# from the message's own timestamp.
+QUICK_REPLY_MAX_AGE_SECONDS = 86400
+
+
+def _quick_reply_message_age(message) -> float:
+    """Seconds since ``message`` was sent, or 0.0 when undeterminable.
+
+    Fails open: a message whose date cannot be read is treated as fresh.  The
+    authorization gate is the real control here; an unreadable timestamp should
+    not silently break the button.
+    """
+    date = getattr(message, "date", None)
+    stamp = getattr(date, "timestamp", None)
+    if not callable(stamp):
+        return 0.0
+    try:
+        return max(0.0, time.time() - float(stamp()))
+    except Exception:
+        return 0.0
+
+
+
+# Container-update plan buttons (``cu:<plan_id>``).  The plan itself is written
+# by the nightly container-updates check; this side only validates the id, asks
+# that script whether the plan is still tappable, and launches its worker.
+CONTAINER_UPDATE_SCRIPT = "/home/archon/.hermes/scripts/container-updates-check.py"
+_CONTAINER_UPDATE_PLAN_ID_RE = re.compile(r"^\d{8}-\d{6}$")
+
+
+def _container_update_plan_verdict(plan_id: str) -> dict:
+    """Ask the check script whether this plan should run. Blocking; call in a thread.
+
+    The verdict comes from the script rather than being recomputed here on
+    purpose: a second copy of "is this plan still valid" living in the adapter is
+    how a Started toast ends up on a run that then refuses itself.
+    """
+    import json as _json
+    import subprocess as _subprocess
+
+    try:
+        proc = _subprocess.run(
+            [sys.executable, CONTAINER_UPDATE_SCRIPT, "--check-plan", plan_id],
+            capture_output=True, text=True, timeout=20,
+        )
+        if proc.returncode != 0:
+            return {"ok": False, "reason": "Update plan could not be read."}
+        return _json.loads((proc.stdout or "").strip().splitlines()[-1])
+    except Exception as exc:
+        logger.warning("[Telegram] container-update plan check failed: %s", exc)
+        return {"ok": False, "reason": "Update plan could not be read."}
+
+
+def _launch_container_update_worker(plan_id: str) -> bool:
+    """Spawn the detached worker. Blocking; call in a thread.
+
+    start_new_session detaches it from the gateway: a gateway restart mid-sweep
+    must not kill a run that is halfway through recreating containers, and the
+    worker resumes from its own plan file if it is killed anyway.
+    """
+    import subprocess as _subprocess
+
+    try:
+        with open(os.devnull, "wb") as devnull:
+            _subprocess.Popen(
+                [sys.executable, CONTAINER_UPDATE_SCRIPT, "--apply-plan", plan_id],
+                stdin=_subprocess.DEVNULL, stdout=devnull, stderr=devnull,
+                start_new_session=True,
+            )
+        return True
+    except Exception as exc:
+        logger.error("[Telegram] container-update worker launch failed: %s", exc)
+        return False
+
+
 def _redact_telegram_error_text(error: object) -> str:
     """Redact secrets from Telegram transport errors before logging or returning them."""
     text = "" if error is None else str(error)
@@ -6467,8 +6545,9 @@ class TelegramAdapter(BasePlatformAdapter):
             if choices:
                 # Render full option text in the message body so mobile
                 # users can read long choices that would be truncated in
-                # inline button labels.  Buttons keep short numeric labels
-                # (1, 2, …, Other) to avoid Telegram truncation.
+                # inline button labels.  Buttons show a truncated copy of
+                # the same label (see below) so the captions are
+                # meaningful instead of bare numbers.
                 option_lines = "\n".join(
                     f"{i + 1}. {_html.escape(str(c))}"
                     for i, c in enumerate(choices)
@@ -6484,12 +6563,24 @@ class TelegramAdapter(BasePlatformAdapter):
 
             if choices:
                 # Telegram caps callback_data at 64 bytes; keep "cl:<id>:<idx>"
-                # short.
+                # short.  Button captions use a truncated copy of the
+                # choice label so users see the actual option, not "1/2/3".
                 rows = []
-                for idx in range(len(choices)):
+                for idx, choice in enumerate(choices):
+                    label = str(choice).strip() or str(idx + 1)
+                    # Telegram inline-button text is capped at 64 chars
+                    # (and long labels wrap awkwardly on mobile).  Keep
+                    # ~30 visible chars to stay readable across clients.
+                    # NOTE: slicing is by code point, so a label longer
+                    # than 30 whose 30th boundary falls inside a grapheme
+                    # cluster (ZWJ emoji, skin-tone/VS16 sequences, flags)
+                    # can split mid-cluster.  Acceptable for choice labels,
+                    # which are short and rarely emoji-dense.
+                    if len(label) > 30:
+                        label = label[:29].rstrip() + "…"
                     rows.append([
                         InlineKeyboardButton(
-                            str(idx + 1),
+                            label,
                             callback_data=f"cl:{clarify_id}:{idx}",
                         )
                     ])
@@ -7408,6 +7499,127 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         # --- Clarify callbacks (cl:clarify_id:idx | cl:clarify_id:other) ---
+        # --- Container-update plan buttons (cu:<plan_id>) ---
+        # Deliberately NOT a qr: payload.  A qr tap is replayed as chat text, so
+        # "update all" meant a model re-derived the pending list at tap time and
+        # drove Docker by hand — non-deterministic, and it died on the turn limit
+        # mid-sweep.  This payload names a plan the nightly report already froze;
+        # the gateway only launches the deterministic worker for it.  The payload
+        # is client-supplied, so the id is shape-checked and never interpolated
+        # into a shell.
+        if data.startswith("cu:"):
+            plan_id = data[3:].strip()
+            caller_id = str(getattr(query.from_user, "id", ""))
+
+            if not _CONTAINER_UPDATE_PLAN_ID_RE.match(plan_id):
+                await query.answer()
+                return
+
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=str(query_chat_id) if query_chat_id is not None else None,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="\u26d4 You are not authorized to use this button.")
+                return
+
+            verdict = await asyncio.to_thread(_container_update_plan_verdict, plan_id)
+            if not verdict.get("ok"):
+                # Strip the keyboard too: a plan that is superseded, already
+                # applied or expired will never become tappable again.
+                try:
+                    await query_message.edit_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+                await query.answer(text=verdict.get("reason") or "Not available.", show_alert=True)
+                return
+
+            # Strip BEFORE launching — the button ceasing to exist is the first
+            # line of double-tap defence; the worker's flock is the real one.
+            try:
+                await query_message.edit_reply_markup(reply_markup=None)
+            except Exception as exc:
+                logger.debug("[Telegram] container-update keyboard strip failed: %s", exc)
+
+            launched = await asyncio.to_thread(_launch_container_update_worker, plan_id)
+            if not launched:
+                await query.answer(text="Could not start the update worker.", show_alert=True)
+                return
+            pending = verdict.get("pending") or 0
+            await query.answer(text=f"Applying {pending} update{'s' if pending != 1 else ''}\u2026")
+            logger.info(
+                "[Telegram] Container-update plan launched (user=%s, plan=%s, pending=%s)",
+                query_user_name or caller_id, plan_id, pending,
+            )
+            return
+
+        # --- Quick-reply buttons ---
+        # ``qr:<text>`` — the payload IS the message text.  A tap is exactly
+        # equivalent to the user typing it, and confers no capability the
+        # caller did not already have, which is why the payload being
+        # client-supplied is safe once the authorization gate has passed.
+        if data.startswith("qr:"):
+            payload = data[3:].strip()
+            caller_id = str(getattr(query.from_user, "id", ""))
+
+            if not payload:
+                await query.answer()
+                return
+
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=str(query_chat_id) if query_chat_id is not None else None,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="\u26d4 You are not authorized to use this button.")
+                return
+
+            if _quick_reply_message_age(query_message) > QUICK_REPLY_MAX_AGE_SECONDS:
+                await query.answer(text="This button has expired.")
+                try:
+                    await query_message.edit_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+                return
+
+            # Strip the keyboard BEFORE dispatching: the button ceasing to
+            # exist is the single-use guarantee.  Best-effort by nature — two
+            # taps genuinely in flight can still both dispatch.
+            try:
+                await query_message.edit_reply_markup(reply_markup=None)
+            except Exception as exc:
+                logger.debug("[Telegram] quick-reply keyboard strip failed: %s", exc)
+
+            await query.answer(text="Sent")
+
+            event = self._build_message_event(query_message, MessageType.TEXT)
+            event.text = payload
+            # ``query_message`` was sent by the bot, so _build_message_event
+            # attributes it to the bot.  Re-attribute to whoever tapped, or
+            # authorization and session keying downstream see the wrong author.
+            event.user_id = caller_id
+            event.user_name = query_user_name
+            # ``source`` carries its own copy of the author, and it is the one
+            # authorization actually reads (gateway/run.py: _is_user_authorized).
+            # Overriding only the event fields left the bot's identity on the
+            # source and the synthetic turn was rejected as an unauthorized
+            # user.  ``is_bot`` must be cleared too: the message really was
+            # sent by the bot, but the turn is the tapper's.
+            if event.source is not None:
+                event.source.user_id = caller_id
+                event.source.user_name = query_user_name
+                event.source.is_bot = False
+            logger.info(
+                "[Telegram] Quick-reply button tapped (user=%s, text=%r)",
+                query_user_name or caller_id, payload,
+            )
+            await self.handle_message(event)
+            return
+
         if data.startswith("cl:"):
             parts = data.split(":", 2)
             if len(parts) == 3:
