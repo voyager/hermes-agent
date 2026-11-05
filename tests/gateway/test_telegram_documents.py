@@ -21,6 +21,8 @@ from gateway.platforms.base import (
     SUPPORTED_VIDEO_TYPES,
 )
 from gateway.platforms.event import MessageEvent, MessageType
+from gateway.session_envelope import _media_clause
+from tests.waiting import async_wait_until
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +359,24 @@ class TestMediaGroups:
         assert event.text == "two images"
         assert event.media_urls == ["/tmp/burst-one.jpg", "/tmp/burst-two.jpg"]
         assert len(event.media_types) == 2
+
+    @pytest.mark.asyncio
+    async def test_document_album_passes_native_admission(self, adapter):
+        """Each album document carries an inline flag; losing them in the merge refused the whole album."""
+        docs = [
+            _make_document(file_name="a.pdf", file_obj=_make_file_obj(b"%PDF-a")),
+            _make_document(file_name="b.txt", mime_type="text/plain", file_obj=_make_file_obj(b"plain")),
+            _make_document(file_name="c.pdf", file_obj=_make_file_obj(b"%PDF-c")),
+        ]
+        for doc in docs:
+            msg = _make_message(document=doc, media_group_id="album-1")
+            await adapter._handle_media_message(_make_update(msg), MagicMock())
+
+        await async_wait_until(lambda: adapter.handle_message.await_count == 1)
+        event = adapter.handle_message.await_args.args[0]
+        assert len(event.media_urls) == 3
+        assert event.media_text_inlined == [False, True, False]
+        assert _media_clause(event) is None
 
 
 # ---------------------------------------------------------------------------

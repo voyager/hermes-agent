@@ -48,7 +48,7 @@ def _container_update_plan_verdict(plan_id: str) -> dict:
     try:
         proc = _subprocess.run(
             [sys.executable, CONTAINER_UPDATE_SCRIPT, "--check-plan", plan_id],
-            capture_output=True, text=True, timeout=20,
+            capture_output=True, text=True, timeout=20, check=False,
         )
         if proc.returncode != 0:
             return {"ok": False, "reason": "Update plan could not be read."}
@@ -6751,6 +6751,13 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             pending[key] = event
             return
         existing.absorb_reply_expected(event)
+        had = len(existing.media_urls)
+        if existing.media_text_inlined or event.media_text_inlined:
+            # Native admission refuses a flag list that doesn't match media_urls one-for-one.
+            n = len(event.media_urls)
+            existing.media_text_inlined = (
+                (existing.media_text_inlined + [None] * had)[:had]
+                + (event.media_text_inlined + [None] * n)[:n])
         existing.media_urls.extend(event.media_urls)
         existing.media_types.extend(event.media_types)
         if event.text:
